@@ -1,0 +1,670 @@
+---
+title: "Spruce2.0"
+format: pdf
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+#| echo: false
+library(sf)
+library(terra)
+library(leaflet)
+library(tmap)
+library(tidyverse)
+library(tigris)
+library(arcgislayers)
+library(foreign)
+library(osrm)
+library(readxl)
+library(htmlwidgets)
+library(geojsonsf)
+library(exactextractr)
+library(readxl)
+library(dplyr)
+
+setwd("/Users/madelinepierce/Dropbox/Mac/Desktop/Summer/GIS")
+
+#  Base map 
+maine <- states(cb = TRUE) |>
+  filter(STUSPS == "ME") |>
+  st_transform(4326)
+
+# Roads 
+furl  <- "https://gis.maine.gov/mapservices/rest/services/dot/MaineDOT_OpenData/MapServer/52"
+roads <- arc_select(arc_open(furl))
+
+# Mills
+mills_sf <- read_excel("Mills_Price.xlsx") |>
+  mutate(
+    raw_stumpage_value = as.numeric(gsub("[^0-9.]", "", `Price (Spruce & Fir)`)),
+    product_type        = Type
+  ) |>
+  st_as_sf(coords = c("LON", "LAT"), crs = 4326) |>
+  mutate(mill_id = row_number())
+
+# Rasters 
+index  <- rast("sbw_susc_index_2022_240m.tif")
+share  <- rast("sbw_spruce_fir_share_2022_240m.tif")
+
+conserve <- st_read("Maine_Conserved_Lands/Maine_Conserved_Lands.shp")
+
+conserve_noharvest <- conserve |>
+  filter(grepl("^1-|^2-", GAP_STATUS))
+
+conserve_mask <- rasterize(
+  vect(conserve_noharvest) |> project(crs(index)),
+  index,
+  field = 1
+)
+
+index_harvest <- index |>
+  mask(conserve_mask, inverse = TRUE)
+```
+
+```{r}
+#| echo: false
+
+stumpage_by_county <- c(
+  "AROOSTOOK"    = 30,
+  "PISCATAQUIS"  = 43,
+  "PENOBSCOT"    = 33,
+  "WASHINGTON"   = 26,
+  "HANCOCK"      = 31,
+  "SOMERSET"     = 23,
+  "FRANKLIN"     = 40,
+  "OXFORD"       = 36,
+  "KENNEBEC"     = 32,
+  "KNOX"         = 32,
+  "LINCOLN"      = 32,
+  "WALDO"        = 32,
+  "ANDROSCOGGIN" = 23,
+  "CUMBERLAND"   = 23,
+  "SAGADAHOC"    = 23,
+  "YORK"         = 23
+)
+
+counties_me <- counties(state = "ME", cb = TRUE) |>
+  st_transform(4326) |>
+  select(NAME, geometry)
+
+county_idx      <- st_nearest_feature(mills_sf, counties_me)
+mills_sf$county <- counties_me$NAME[county_idx]
+
+mills_sf <- mills_sf |>
+  mutate(
+    county_upper = toupper(county),
+    stumpage = case_when(
+      product_type == "Sawlog"   ~ replace_na(stumpage_by_county[county_upper], 23),
+      product_type == "Pulpwood" ~ raw_stumpage_value,
+      TRUE                       ~ NA_real_
+    ),
+    price_delivered = case_when(
+      product_type == "Sawlog"   ~ stumpage / 0.33,
+      product_type == "Pulpwood" ~ stumpage / 0.28,
+      TRUE                       ~ NA_real_
+    )
+  )
+
+# Haul time function 
+
+compute_haul_time <- function(p,
+                               stumpage      = 10,
+                               harvest_pct   = 0.33,
+                               truck_tons    = 18.9,
+                               trucking_rate = 90,
+                               load_unload   = 40) {
+  net_per_ton    <- p - (harvest_pct * p) - stumpage
+  load_value     <- net_per_ton * truck_tons
+  round_trip_hrs <- load_value / trucking_rate
+  one_way_min    <- (round_trip_hrs * 60 - load_unload) * 0.5
+  return(one_way_min)
+}
+
+whalley_benchmark_gt <- 5 
+delivered_cost_target_gt <- 30 
+
+## Table 1 defaults
+cf_mhr  <- 60
+cf_kgt  <- 1000
+rho     <- 961
+
+dbh   <- 20
+ds    <- 305
+vtsb  <- 5
+vt    <- 0.3
+nt    <- 35600
+f_hr  <- 0.40
+f_b   <- 0.23
+f_br  <- 0.55
+f_hw  <- 0.4
+p_lc  <- 0.10
+
+## Table 2 machine costs, $/PMH
+c_fb <- 123
+c_gs <- 103
+c_sd <- 131
+c_ch <- 179
+p_c  <- 48
+
+## Stem count per accumulation, based on DBH
+stem_count <- dplyr::case_when(
+  dbh < 10             ~ 5,
+  dbh >= 10 & dbh <= 18 ~ 3,
+  dbh > 18             ~ 1
+)
+sum_dbh <- dbh * stem_count
+
+## Eq. 2.1: Feller buncher productivity (m3/PMH)
+p_fb <- cf_mhr * (1 / exp(-0.888 + 0.136*stem_count + 0.017*sum_dbh)) * vt * stem_count
+
+## Eq. 2.2: Grapple skidder productivity (m3/PMH) - CORRECTED, see note above
+p_gs <- exp(2.632 - 0.002*ds + 0.314*vtsb)
+
+## Eq. 2.4a/2.4b/2.5: Stroke delimber productivity, HW/SW weighted
+p_sd_hw <- (-0.708 + 0.219*dbh)^2
+p_sd_sw <- (-0.058 + 0.219*dbh)^2
+p_sd    <- p_sd_hw*f_hw + p_sd_sw*(1 - f_hw)
+
+## Eq. 2.6-2.10: Stand harvest volumes/masses
+n_th <- nt * f_hr
+v_th <- vt * (1 - f_b) * n_th
+m_th <- v_th * rho / cf_kgt
+v_bh <- f_b * f_br * vt * n_th
+m_bh <- v_bh * rho / cf_kgt
+
+## Eq. 2.11-2.12: Per-machine cost per volume, per area (FB/GS/SD only)
+c_fb_v <- c_fb / p_fb;  c_fb_a <- c_fb_v * vt * n_th
+c_gs_v <- c_gs / p_gs;  c_gs_a <- c_gs_v * vt * n_th
+c_sd_v <- c_sd / p_sd;  c_sd_a <- c_sd_v * vt * n_th
+
+## Chipper: mass-basis conversion
+c_ch_v <- c_ch / p_c
+c_ch_a <- c_ch_v * m_bh
+
+## Eq. 2.14-2.17: Fractions
+v_h  <- v_th + v_bh
+m_h  <- m_th + m_bh
+f_th <- v_th / v_h
+f_bh <- m_bh / m_h
+
+## Eq. 2.19: Proportioned biomass harvest cost (no profit yet)
+c_bhp <- ((c_fb_a + c_gs_a + c_sd_a) * f_bh + c_ch_a) / m_bh
+
+## Logger profit as its own term 
+logger_profit_gt <- c_bhp * p_lc
+c_bhp_with_profit <- c_bhp + logger_profit_gt  
+
+cat(sprintf("\nC_BHp (harvest cost, no profit): $%.2f/GT\n", c_bhp))
+cat(sprintf("Logger profit: $%.2f/GT\n", logger_profit_gt))
+
+
+
+## Trucking cost components 
+e_f   <- 1.786
+c_rm  <- 0.23
+c_pi  <- 0.21
+c_til <- 0.05
+c_a   <- 0.07
+p_tr  <- 0.02
+m_tr  <- 32
+
+avg_truck_speed_kmh <- 80.47
+
+## Firm-specific inputs
+biomass_firms <- tibble::tribble(
+  ~name,                                              ~county,        ~stumpage, ~p_d_gal, ~c_l,
+  "TIMBERHP / GO LAB MADISON FACILITY",                "Somerset",     2,         5.132,    0.4841,
+  "MAINE WOODS PELLET COMPANY LLC",                    "Somerset",     2,         5.132,    0.4841,
+  "NORTHEAST PELLETS LLC",                             "Aroostook",    2,         5.181,    0.4790,
+  "LIGNETICS OF MAINE / GENEVA WOOD FUELS",            "Franklin",     2,         5.193,    0.5171,
+  "REGENERATE LIVERMORE FALLS (FORMERLY REENERGY)",    "Androscoggin", 1,         5.099,    0.5567,
+  "REGENERATE / REENERGY STRATTON",                    "Franklin",     2,         5.193,    0.5171
+)
+
+
+biomass_firms <- biomass_firms |>
+  mutate(
+    p_d_liter          = p_d_gal / 3.785,
+    r_per_km           = (p_d_liter / e_f) + c_l + c_rm + c_pi + c_til + c_a + p_tr,
+    r_per_gt_km        = r_per_km / m_tr,
+    transport_budget_gt = delivered_cost_target_gt - stumpage - c_bhp - logger_profit_gt,
+    d_tr_km            = transport_budget_gt / r_per_gt_km,
+    one_way_km         = d_tr_km / 2,
+    haul_time_min      = (one_way_km / avg_truck_speed_kmh) * 60
+  )
+
+print(biomass_firms, width = Inf)
+
+cat(sprintf("\nWhalley benchmark transport budget: $%.2f/GT (sanity check reference)\n",
+            whalley_benchmark_gt))
+
+## Fallback for biomass
+default_stumpage <- 2
+default_c_l  <- 0.5742
+default_p_d  <- 1.379
+default_r_per_km       <- (default_p_d/e_f) + default_c_l + c_rm + c_pi + c_til + c_a + p_tr
+default_r_per_gt_km    <- default_r_per_km / m_tr
+default_transport_budget_gt <- delivered_cost_target_gt - default_stumpage - c_bhp - logger_profit_gt
+default_d_tr_km        <- default_transport_budget_gt / default_r_per_gt_km
+default_one_way_km     <- default_d_tr_km / 2
+default_haul_time_min  <- (default_one_way_km / avg_truck_speed_kmh) * 60
+
+cat(sprintf("Fallback (unmatched biomass mills): transport budget $%.2f/GT -> %.1f km round-trip -> %.1f min one-way\n",
+            default_transport_budget_gt, default_d_tr_km, default_haul_time_min))
+
+mills_sf <- mills_sf |>
+  left_join(
+    biomass_firms |> select(name, firm_stumpage = stumpage, firm_transport_budget_gt = transport_budget_gt,
+                             firm_haul_time_min = haul_time_min),
+    by = c("NAME" = "name")
+  )
+
+
+
+mills_sf <- mills_sf |>
+  mutate(
+    haul_time_raw = case_when(
+      product_type == "Sawlog"   ~ compute_haul_time(
+                                      price_delivered,
+                                      stumpage      = stumpage,
+                                      harvest_pct   = 0.33,
+                                      truck_tons    = 18.9,
+                                      trucking_rate = 90
+                                    ),
+      product_type == "Pulpwood" ~ compute_haul_time(
+                                      price_delivered,
+                                      stumpage      = stumpage,
+                                      harvest_pct   = 0.32,
+                                      truck_tons    = 33,
+                                      trucking_rate = 78.15
+                                    ),
+      product_type == "Biomass"  ~ coalesce(firm_haul_time_min, default_haul_time_min),
+      TRUE                       ~ default_haul_time_min
+    ),
+    uses_formula  = product_type %in% c("Sawlog", "Pulpwood") & haul_time_raw > 0,
+    haul_time_min = if_else(haul_time_raw <= 0,
+                            default_haul_time_min,
+                            haul_time_raw)
+  )
+
+mills_sf |>
+  st_drop_geometry() |>
+  group_by(product_type, uses_formula) |>
+  summarise(
+    n         = n(),
+    mean_haul = round(mean(haul_time_min), 1),
+    min_haul  = round(min(haul_time_min), 1),
+    max_haul  = round(max(haul_time_min), 1),
+    .groups   = "drop"
+  ) |>
+  print()
+
+# Detailed per-mill check for Biomass specifically
+mills_sf |>
+  st_drop_geometry() |>
+  filter(product_type == "Biomass") |>
+  select(NAME, county, firm_stumpage, firm_haul_time_min, haul_time_min) |>
+  print()
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+
+# Point R at local OSRM server (must have Docker server running in Terminal)
+options(osrm.server = "http://localhost:5001/")
+options(osrm.profile = "driving")
+
+sheds_list <- lapply(seq_len(nrow(mills_sf)), function(i) {
+  tryCatch({
+    ht <- mills_sf$haul_time_min[i]
+    if (!is.finite(ht) || ht <= 0) {
+      message("Mill ", i, " (", mills_sf$NAME[i], ") skipped: invalid haul time")
+      return(NULL)
+    }
+    iso <- osrmIsochrone(
+      loc    = mills_sf[i, ],
+      breaks = c(0, ht),
+      n      = 500
+    )
+    iso$mill_id       <- i
+    iso$mill_name     <- mills_sf$NAME[i]
+    iso$mill_type     <- mills_sf$TYPE_NEW[i]
+    iso$product_type  <- mills_sf$product_type[i]
+    iso$price         <- mills_sf$price_delivered[i]
+    iso$haul_time_min <- ht
+    iso$uses_formula  <- mills_sf$uses_formula[i]
+    iso
+  }, error = function(e) {
+    message("Mill ", i, " (", mills_sf$NAME[i], ") failed: ", conditionMessage(e))
+    NULL
+  })
+})
+
+sheds_list <- sheds_list[!sapply(sheds_list, is.null)]
+sheds      <- do.call(rbind, sheds_list) |> st_make_valid()
+
+st_write(sheds, "sheds_priced.gpkg", delete_dsn = TRUE)
+
+
+procurement_zone_sawlog  <- st_union(sheds[sheds$product_type == "Sawlog", ])
+procurement_zone_pulp    <- st_union(sheds[sheds$product_type == "Pulpwood", ])
+procurement_zone_biomass <- st_union(sheds[sheds$product_type == "Biomass", ])
+procurement_zone_all     <- st_union(sheds)
+```
+
+```{r}
+#| echo: false
+
+index_proj <- project(index_harvest, crs(sheds))
+share_proj <- project(share, crs(sheds))
+
+mills_sf <- mills_sf |>
+  mutate(
+    sbw_mean = sapply(mill_id, function(i) {
+      s <- sheds[sheds$mill_id == i, ]
+      if (nrow(s) == 0) return(NA)
+      round(exact_extract(index_proj,
+                          st_transform(s, crs(index_proj)), "mean"), 3)
+    }),
+    sbw_min = sapply(mill_id, function(i) {
+      s <- sheds[sheds$mill_id == i, ]
+      if (nrow(s) == 0) return(NA)
+      round(exact_extract(index_proj,
+                          st_transform(s, crs(index_proj)), "min"), 2)
+    }),
+    sbw_max = sapply(mill_id, function(i) {
+      s <- sheds[sheds$mill_id == i, ]
+      if (nrow(s) == 0) return(NA)
+      round(exact_extract(index_proj,
+                          st_transform(s, crs(index_proj)), "max"), 2)
+    }),
+    sbw_range     = paste0(sbw_min, " - ", sbw_max),
+    # Spruce-fir share: mean fraction of forest composition that is
+    # spruce-fir within each mill's own procurement shed 
+    spruce_fir_share_mean = sapply(mill_id, function(i) {
+      s <- sheds[sheds$mill_id == i, ]
+      if (nrow(s) == 0) return(NA)
+      round(exact_extract(share_proj,
+                          st_transform(s, crs(share_proj)), "mean"), 3)
+    }),
+    shed_area_km2 = sapply(mill_id, function(i) {
+      s <- sheds[sheds$mill_id == i, ]
+      if (nrow(s) == 0) return(NA)
+      round(as.numeric(st_area(st_transform(s, 32619))) / 1e6, 1)
+    })
+  )
+
+mills_sf |>
+  st_drop_geometry() |>
+  group_by(product_type) |>
+  summarise(
+    n                    = n(),
+    mean_sbw_index       = round(mean(sbw_mean, na.rm = TRUE), 3),
+    mean_spruce_fir_share = round(mean(spruce_fir_share_mean, na.rm = TRUE), 3),
+    mean_shed_area_km2   = round(mean(shed_area_km2, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) |>
+  print()
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+#| echo: false
+
+# Stat Analysis 
+
+## Analysis 1: High-risk acreage inside vs. outside procurement zones
+
+risk_vals <- terra::values(index_harvest, na.rm = TRUE)
+high_risk_threshold <- quantile(risk_vals, 0.75)
+cat(sprintf("High-risk SBW index threshold (75th percentile): %.3f\n", high_risk_threshold))
+
+high_risk <- index_harvest > high_risk_threshold
+high_risk[high_risk == 0] <- NA
+
+cell_area_km2 <- prod(res(index_harvest)) / 1e6
+
+total_high_risk_km2 <- sum(terra::values(high_risk), na.rm = TRUE) * cell_area_km2
+cat(sprintf("Total high-risk area (study-wide): %.1f km2\n\n", total_high_risk_km2))
+
+zones <- list(
+  Sawlog   = procurement_zone_sawlog,
+  Pulpwood = procurement_zone_pulp,
+  Biomass  = procurement_zone_biomass
+)
+
+high_risk_summary <- purrr::map_dfr(names(zones), function(nm) {
+  zone <- st_transform(zones[[nm]], crs(high_risk))
+  inside_km2 <- exact_extract(high_risk, zone, "sum") * cell_area_km2
+  tibble(
+    product_type            = nm,
+    high_risk_inside_km2    = round(inside_km2, 1),
+    high_risk_outside_km2   = round(total_high_risk_km2 - inside_km2, 1),
+    pct_high_risk_captured  = round(100 * inside_km2 / total_high_risk_km2, 1)
+  )
+})
+
+cat("High-risk acreage captured by product-type procurement zone:\n")
+print(high_risk_summary)
+
+all_zones_union <- zones |>
+  purrr::map(~ st_transform(.x, crs(high_risk))) |>
+  purrr::map(st_geometry) |>
+  purrr::reduce(c) |>          # combine geometries from all three sf objects
+  st_union() |>                # dissolve overlaps into one polygon
+  st_sf(geometry = _)
+
+combined_inside_km2 <- exact_extract(high_risk, all_zones_union, "sum") * cell_area_km2
+
+combined_row <- tibble(
+  product_type            = "All mill types combined",
+  high_risk_inside_km2    = round(combined_inside_km2, 1),
+  high_risk_outside_km2   = round(total_high_risk_km2 - combined_inside_km2, 1),
+  pct_high_risk_captured  = round(100 * combined_inside_km2 / total_high_risk_km2, 1)
+)
+
+high_risk_summary <- bind_rows(high_risk_summary, combined_row)
+
+cat("High-risk acreage captured by product-type procurement zone (with combined total):\n")
+print(high_risk_summary)
+
+## Analysis 2: Cross-product comparison of zone characteristics
+
+comparison_table <- mills_sf |>
+  st_drop_geometry() |>
+  group_by(product_type) |>
+  summarise(
+    n_mills               = n(),
+    mean_sbw_index        = round(mean(sbw_mean, na.rm = TRUE), 3),
+    mean_spruce_fir_share = round(mean(spruce_fir_share_mean, na.rm = TRUE), 3),
+    mean_shed_area_km2    = round(mean(shed_area_km2, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+cat("\nCross-product comparison of procurement zone characteristics:\n")
+print(comparison_table)
+
+
+cat("\nKruskal-Wallis test: SBW index by product type\n")
+print(kruskal.test(sbw_mean ~ product_type, data = mills_sf))
+
+cat("\nKruskal-Wallis test: spruce-fir share by product type\n")
+print(kruskal.test(spruce_fir_share_mean ~ product_type, data = mills_sf))
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+#| echo: false
+
+index_wgs   <- terra::project(index_harvest, "EPSG:4326", method = "bilinear")
+index_wgs_r <- raster::raster(index_wgs)  # leaflet needs {raster}, not {terra}
+
+
+pal <- colorNumeric(
+  palette   = "YlOrRd",
+  domain    = raster::values(index_wgs_r),
+  na.color  = "transparent"
+)
+
+
+mill_colors <- colorFactor(
+  palette = c("#ff9999", "#ffd700", "white"),
+  levels  = c("Sawlog", "Pulpwood", "Biomass")
+)
+
+
+mills_geo <- st_transform(mills_sf, 4326)
+
+m <- leaflet() |>
+  addProviderTiles("Esri.WorldGrayCanvas") |>
+  addRasterImage(index_wgs_r, colors = pal, opacity = 0.8) |>
+  addLegend(
+    pal      = pal,
+    values   = raster::values(index_wgs_r),
+    title    = "SBW Susceptibility Index",
+    position = "bottomright"
+  ) |>
+  addLegend(
+    position = "bottomleft",
+    colors   = c("#ff9999", "#ffd700", "white"),
+    labels   = c("Sawlog",
+                 "Pulpwood",
+                 "Biomass"),
+    title    = "Mill type",
+    opacity  = 1
+  ) |>
+  addPolygons(
+    data        = st_transform(procurement_zone_sawlog, 4326),
+    color       = "black", weight = 1.5, dashArray = "5",
+    fillOpacity = 0, group = "Sawlog zone (formula-derived)"
+  ) |>
+  addPolygons(
+    data        = st_transform(procurement_zone_pulp, 4326),
+    color       = "#cc7a00", weight = 1.5, dashArray = "8",
+    fillOpacity = 0, group = "Pulpwood zone (formula-derived)"
+  ) |>
+  addPolygons(
+    data        = st_transform(procurement_zone_biomass, 4326),
+    color       = "gray50", weight = 1, dashArray = "3",
+    fillOpacity = 0, group = "Biomass zone (fixed radius)"
+  ) |>
+  addCircleMarkers(
+    data        = mills_geo,
+    radius      = 5,
+    color       = "black",
+    fillColor   = ~mill_colors(product_type),
+    fillOpacity = 1,
+    weight      = 1,
+    layerId     = ~paste0("mill_", mill_id),
+    popup       = ~paste0(
+      "<b>", NAME, "</b><br>",
+      "Town: ", TOWN, "<br>",
+      "Type: ", TYPE_NEW, "<br>",
+      "Product: ", product_type, "<br>",
+      "Delivered price: $", price_delivered, "/ton<br>",
+      "County stumpage: $", stumpage, "/ton<br>",
+      ifelse(product_type == "Biomass" & !is.na(firm_stumpage),
+             paste0("Firm-specific stumpage: $", firm_stumpage, "/GT<br>",
+                    "Residual transport budget: $", round(firm_transport_budget_gt, 2), "/GT<br>"),
+             ""),
+      "Haul time: ", round(haul_time_min, 1), " min",
+      ifelse(uses_formula,
+             " (formula-derived)",
+             " (formula-derived)"), "<br>",
+      "SBW index mean: ", sbw_mean, "<br>",
+      "SBW index range: ", sbw_range, "<br>",
+      "Spruce-fir share (shed mean): ", sprintf("%.1f%%", spruce_fir_share_mean * 100), "<br>",
+      "Shed area: ", shed_area_km2, " km²"
+    )
+  ) |>
+  addLayersControl(
+    overlayGroups = c("Sawlog zone (formula-derived)",
+                       "Pulpwood zone (formula-derived)",
+                       "Biomass zone (fixed radius)"),
+    options       = layersControlOptions(collapsed = FALSE)
+  )
+
+sheds_wgs  <- st_transform(sheds, 4326) |> select(mill_id, mill_name)
+sheds_json <- geojsonsf::sf_geojson(sheds_wgs)
+
+m <- m |>
+  htmlwidgets::onRender(paste0("
+    function(el, x) {
+      var map = this;
+      var shedsData = ", sheds_json, ";
+      var shedLayer = null;
+      var activeMillId = null;
+
+      function clearShed() {
+        if (shedLayer) {
+          map.removeLayer(shedLayer);
+          shedLayer = null;
+          activeMillId = null;
+        }
+      }
+
+      map.on('click', function(e) {
+        // Clicking the basemap (not a marker) clears the highlighted shed.
+        clearShed();
+      });
+
+      map.eachLayer(function(layer) {
+        if (layer.options && layer.options.layerId &&
+            String(layer.options.layerId).startsWith('mill_')) {
+
+          layer.on('click', function(ev) {
+            var millId = String(layer.options.layerId).replace('mill_', '');
+
+            // Second click on the same mill toggles the shed off.
+            if (activeMillId === millId) {
+              clearShed();
+              return;
+            }
+
+            clearShed();
+            activeMillId = millId;
+
+            var match = shedsData.features.filter(function(f) {
+              return String(f.properties.mill_id) === millId;
+            });
+
+            if (match.length === 0) {
+              return; // mill has no shed (e.g. dropped from OSRM step)
+            }
+
+            shedLayer = L.geoJSON({type: 'FeatureCollection', features: match}, {
+              style: {
+                color: '#1f78ff',
+                weight: 3,
+                fillColor: '#1f78ff',
+                fillOpacity: 0.15
+              }
+            }).addTo(map);
+
+            map.fitBounds(shedLayer.getBounds(), {maxZoom: 11});
+          });
+        }
+      });
+    }
+  "))
+
+m
+```
+
+```{r}
+#| echo: false
+library(htmlwidgets)
+saveWidget(m, "procurement_map_3.html", selfcontained = TRUE)
+```
